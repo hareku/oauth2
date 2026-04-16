@@ -9,14 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
 	"time"
-
-	"golang.org/x/oauth2/internal"
 )
 
 type mockTransport struct {
@@ -34,8 +31,9 @@ func newConf(url string) *Config {
 		RedirectURL:  "REDIRECT_URL",
 		Scopes:       []string{"scope1", "scope2"},
 		Endpoint: Endpoint{
-			AuthURL:  url + "/auth",
-			TokenURL: url + "/token",
+			AuthURL:       url + "/auth",
+			DeviceAuthURL: url + "/device",
+			TokenURL:      url + "/token",
 		},
 	}
 }
@@ -106,7 +104,7 @@ func TestExchangeRequest(t *testing.T) {
 		if headerContentType != "application/x-www-form-urlencoded" {
 			t.Errorf("Unexpected Content-Type header %q", headerContentType)
 		}
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("Failed reading request body: %s.", err)
 		}
@@ -150,7 +148,7 @@ func TestExchangeRequest_CustomParam(t *testing.T) {
 		if headerContentType != "application/x-www-form-urlencoded" {
 			t.Errorf("Unexpected Content-Type header, %v is found.", headerContentType)
 		}
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("Failed reading request body: %s.", err)
 		}
@@ -196,7 +194,7 @@ func TestExchangeRequest_JSONResponse(t *testing.T) {
 		if headerContentType != "application/x-www-form-urlencoded" {
 			t.Errorf("Unexpected Content-Type header, %v is found.", headerContentType)
 		}
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("Failed reading request body: %s.", err)
 		}
@@ -303,7 +301,7 @@ func testExchangeRequest_JSONResponse_expiry(t *testing.T, exp string, want, nul
 	conf := newConf(ts.URL)
 	t1 := time.Now().Add(day)
 	tok, err := conf.Exchange(context.Background(), "exchange-code")
-	t2 := t1.Add(day)
+	t2 := time.Now().Add(day)
 
 	if got := (err == nil); got != want {
 		if want {
@@ -355,7 +353,6 @@ func TestExchangeRequest_BadResponseType(t *testing.T) {
 }
 
 func TestExchangeRequest_NonBasicAuth(t *testing.T) {
-	internal.ResetAuthCache()
 	tr := &mockTransport{
 		rt: func(r *http.Request) (w *http.Response, err error) {
 			headerAuth := r.Header.Get("Authorization")
@@ -396,7 +393,7 @@ func TestPasswordCredentialsTokenRequest(t *testing.T) {
 		if headerContentType != expected {
 			t.Errorf("Content-Type header = %q; want %q", headerContentType, expected)
 		}
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("Failed reading request body: %s.", err)
 		}
@@ -427,7 +424,6 @@ func TestPasswordCredentialsTokenRequest(t *testing.T) {
 }
 
 func TestTokenRefreshRequest(t *testing.T) {
-	internal.ResetAuthCache()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.String() == "/somethingelse" {
 			return
@@ -439,7 +435,7 @@ func TestTokenRefreshRequest(t *testing.T) {
 		if headerContentType != "application/x-www-form-urlencoded" {
 			t.Errorf("Unexpected Content-Type header %q", headerContentType)
 		}
-		body, _ := ioutil.ReadAll(r.Body)
+		body, _ := io.ReadAll(r.Body)
 		if string(body) != "grant_type=refresh_token&refresh_token=REFRESH_TOKEN" {
 			t.Errorf("Unexpected refresh token payload %q", body)
 		}
@@ -464,7 +460,7 @@ func TestFetchWithNoRefreshToken(t *testing.T) {
 		if headerContentType != "application/x-www-form-urlencoded" {
 			t.Errorf("Unexpected Content-Type header, %v is found.", headerContentType)
 		}
-		body, _ := ioutil.ReadAll(r.Body)
+		body, _ := io.ReadAll(r.Body)
 		if string(body) != "client_id=CLIENT_ID&grant_type=refresh_token&refresh_token=REFRESH_TOKEN" {
 			t.Errorf("Unexpected refresh token payload, %v is found.", string(body))
 		}
@@ -484,6 +480,7 @@ func TestTokenRetrieveError(t *testing.T) {
 			t.Errorf("Unexpected token refresh request URL, %v is found.", r.URL)
 		}
 		w.Header().Set("Content-type", "application/json")
+		// "The authorization server responds with an HTTP 400 (Bad Request)" https://www.rfc-editor.org/rfc/rfc6749#section-5.2
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error": "invalid_grant"}`))
 	}))
@@ -493,14 +490,46 @@ func TestTokenRetrieveError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("got no error, expected one")
 	}
-	_, ok := err.(*RetrieveError)
+	re, ok := err.(*RetrieveError)
 	if !ok {
 		t.Fatalf("got %T error, expected *RetrieveError; error was: %v", err, err)
 	}
-	// Test error string for backwards compatibility
-	expected := fmt.Sprintf("oauth2: cannot fetch token: %v\nResponse: %s", "400 Bad Request", `{"error": "invalid_grant"}`)
+	expected := `oauth2: "invalid_grant"`
 	if errStr := err.Error(); errStr != expected {
 		t.Fatalf("got %#v, expected %#v", errStr, expected)
+	}
+	expected = "invalid_grant"
+	if re.ErrorCode != expected {
+		t.Fatalf("got %#v, expected %#v", re.ErrorCode, expected)
+	}
+}
+
+// TestTokenRetrieveError200 tests handling of unorthodox server that returns 200 in error case
+func TestTokenRetrieveError200(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.String() != "/token" {
+			t.Errorf("Unexpected token refresh request URL, %v is found.", r.URL)
+		}
+		w.Header().Set("Content-type", "application/json")
+		w.Write([]byte(`{"error": "invalid_grant"}`))
+	}))
+	defer ts.Close()
+	conf := newConf(ts.URL)
+	_, err := conf.Exchange(context.Background(), "exchange-code")
+	if err == nil {
+		t.Fatalf("got no error, expected one")
+	}
+	re, ok := err.(*RetrieveError)
+	if !ok {
+		t.Fatalf("got %T error, expected *RetrieveError; error was: %v", err, err)
+	}
+	expected := `oauth2: "invalid_grant"`
+	if errStr := err.Error(); errStr != expected {
+		t.Fatalf("got %#v, expected %#v", errStr, expected)
+	}
+	expected = "invalid_grant"
+	if re.ErrorCode != expected {
+		t.Fatalf("got %#v, expected %#v", re.ErrorCode, expected)
 	}
 }
 
